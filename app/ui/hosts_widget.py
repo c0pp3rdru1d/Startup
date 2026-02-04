@@ -1,26 +1,27 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from typing import Any, List, Optional
+
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QSortFilterProxyModel, Signal
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
-    QMessageBox,
-    QLineEdit,
-    QCheckBox,
     QLabel,
     QDialog,
     QFormLayout,
+    QLineEdit,
+    QCheckBox,
     QDialogButtonBox,
+    QMessageBox,
+    QTableView,
 )
 
 from sqlmodel import select
-
 from app.db import get_session
 from app.models import Host
+from app.ui.host_detail_dialog import HostDetailDialog
 
 
 class HostDialog(QDialog):
@@ -31,14 +32,17 @@ class HostDialog(QDialog):
 
         self.name = QLineEdit(host.name if host else "")
         self.addr = QLineEdit(host.address if host else "")
-        self.tags = QLineEdit(host.tags if host else "")
+        self.tcp_ports = QLineEdit(getattr(host, "tcp_ports", "") if host else "")
+        self.tcp_ports.setPlaceholderText("e.g. 3389,445,5985 (leave blank to disable TCP checks)")
+
         self.enabled = QCheckBox("Enabled")
         self.enabled.setChecked(host.enabled if host else True)
 
         form = QFormLayout()
         form.addRow("Name", self.name)
         form.addRow("Address", self.addr)
-        form.addRow("Tags", self.tags)
+        form.addRow("Tags (comma)", self.tags)
+        form.addRow("TCP Ports (comma)", self.tcp_ports)
         form.addRow("", self.enabled)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -49,26 +53,113 @@ class HostDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(buttons)
 
-    def get_data(self) -> tuple[str, str, str, bool]:
+    def get_data(self) -> tuple[str, str, str, str, bool]:
         return (
             self.name.text().strip(),
             self.addr.text().strip(),
             self.tags.text().strip(),
+            self.tcp_ports.text().strip(),
             self.enabled.isChecked(),
         )
+
+
+class HostsModel(QAbstractTableModel):
+    COLS = ["ID", "Name", "Address", "Tags", "TCP Ports", "Enabled"]
+
+    def __init__(self):
+        super().__init__()
+        self.hosts: List[Host] = []
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return len(self.hosts)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return len(self.COLS)
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole) -> Any:
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            return self.COLS[section]
+        return section + 1
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:
+        if not index.isValid():
+            return None
+        h = self.hosts[index.row()]
+        col = index.column()
+
+        if role == Qt.DisplayRole:
+            if col == 0:
+                return str(h.id)
+            if col == 1:
+                return h.name
+            if col == 2:
+                return h.address
+            if col == 3:
+                return h.tags
+            if col == 4:
+                return getattr(h, "tcp_ports", "22,80,443")
+            if col == 5:
+                return "Yes" if h.enabled else "No"
+
+        return None
+
+    def set_hosts(self, hosts: List[Host]) -> None:
+        self.beginResetModel()
+        self.hosts = hosts
+        self.endResetModel()
+
+    def get_host_at(self, row: int) -> Optional[Host]:
+        if 0 <= row < len(self.hosts):
+            return self.hosts[row]
+        return None
+
+
+class HostsFilterProxy(QSortFilterProxyModel):
+    def __init__(self):
+        super().__init__()
+        self._needle = ""
+
+    def set_search(self, text: str) -> None:
+        self._needle = (text or "").strip().lower()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        if not self._needle:
+            return True
+
+        m: HostsModel = self.sourceModel()  # type: ignore
+        h = m.get_host_at(source_row)
+        if not h:
+            return False
+
+        blob = f"{h.name} {h.address} {h.tags} {getattr(h,'tcp_ports','')}".lower()
+        return self._needle in blob
 
 
 class HostsWidget(QWidget):
     hosts_changed = Signal()
 
-    COLS = ["ID", "Name", "Address", "Tags", "Enabled"]
-
     def __init__(self):
         super().__init__()
 
-        self.table = QTableWidget(0, len(self.COLS))
-        self.table.setHorizontalHeaderLabels(self.COLS)
-        self.table.setSortingEnabled(True)
+        self.model = HostsModel()
+        self.proxy = HostsFilterProxy()
+        self.proxy.setSourceModel(self.model)
+
+        self.view = QTableView()
+        self.view.setModel(self.proxy)
+        self.view.setAlternatingRowColors(True)
+        self.view.setSelectionBehavior(QTableView.SelectRows)
+        self.view.setSelectionMode(QTableView.SingleSelection)
+        self.view.setSortingEnabled(True)
+        self.view.horizontalHeader().setStretchLastSection(True)
+        self.view.doubleClicked.connect(self.open_details)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search hosts (name, address, tags, ports)…")
+        self.search.textChanged.connect(self.proxy.set_search)
 
         self.btn_add = QPushButton("Add")
         self.btn_edit = QPushButton("Edit")
@@ -90,101 +181,91 @@ class HostsWidget(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addLayout(top)
-        layout.addWidget(self.table)
+        layout.addWidget(self.search)
+        layout.addWidget(self.view)
 
         self.refresh()
 
     def refresh(self) -> None:
         with get_session() as session:
             hosts = list(session.exec(select(Host)))
-
-        self.table.setRowCount(0)
-        for h in hosts:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-
-            self.table.setItem(row, 0, QTableWidgetItem(str(h.id)))
-            self.table.setItem(row, 1, QTableWidgetItem(h.name))
-            self.table.setItem(row, 2, QTableWidgetItem(h.address))
-            self.table.setItem(row, 3, QTableWidgetItem(h.tags))
-            self.table.setItem(row, 4, QTableWidgetItem("Yes" if h.enabled else "No"))
-
+        self.model.set_hosts(hosts)
         self.hosts_changed.emit()
 
-    def _selected_host_id(self) -> int | None:
-        items = self.table.selectedItems()
-        if not items:
+    def _selected_host(self) -> Host | None:
+        idxs = self.view.selectionModel().selectedRows()
+        if not idxs:
             return None
-        # ID is column 0
-        try:
-            return int(items[0].text())
-        except ValueError:
-            return None
+        proxy_index = idxs[0]
+        source_index = self.proxy.mapToSource(proxy_index)
+        return self.model.get_host_at(source_index.row())
+
+    def open_details(self) -> None:
+        h = self._selected_host()
+        if not h or h.id is None:
+            return
+        dlg = HostDetailDialog(int(h.id), parent=self)
+        dlg.exec()
 
     def add_host(self) -> None:
         dlg = HostDialog(self)
         if dlg.exec() != QDialog.Accepted:
             return
 
-        name, addr, tags, enabled = dlg.get_data()
+        name, addr, tags, tcp_ports, enabled = dlg.get_data()
         if not name or not addr:
             QMessageBox.warning(self, "Validation", "Name and Address are required.")
             return
 
         with get_session() as session:
-            session.add(Host(name=name, address=addr, tags=tags, enabled=enabled))
+            session.add(Host(name=name, address=addr, tags=tags, tcp_ports=tcp_ports, enabled=enabled))
             session.commit()
 
         self.refresh()
 
     def edit_host(self) -> None:
-        hid = self._selected_host_id()
-        if hid is None:
+        host = self._selected_host()
+        if not host or host.id is None:
             QMessageBox.information(self, "Edit", "Select a host row first.")
             return
-
-        with get_session() as session:
-            host = session.get(Host, hid)
-            if not host:
-                QMessageBox.warning(self, "Edit", "Host not found.")
-                return
 
         dlg = HostDialog(self, host=host)
         if dlg.exec() != QDialog.Accepted:
             return
 
-        name, addr, tags, enabled = dlg.get_data()
+        name, addr, tags, tcp_ports, enabled = dlg.get_data()
         if not name or not addr:
             QMessageBox.warning(self, "Validation", "Name and Address are required.")
             return
 
         with get_session() as session:
-            host2 = session.get(Host, hid)
-            if not host2:
+            h2 = session.get(Host, host.id)
+            if not h2:
                 QMessageBox.warning(self, "Edit", "Host not found.")
                 return
-            host2.name = name
-            host2.address = addr
-            host2.tags = tags
-            host2.enabled = enabled
-            session.add(host2)
+            h2.name = name
+            h2.address = addr
+            h2.tags = tags
+            h2.tcp_ports = tcp_ports
+            h2.enabled = enabled
+            session.add(h2)
             session.commit()
 
         self.refresh()
 
     def delete_host(self) -> None:
-        hid = self._selected_host_id()
-        if hid is None:
+        host = self._selected_host()
+        if not host or host.id is None:
             QMessageBox.information(self, "Delete", "Select a host row first.")
             return
 
-        if QMessageBox.question(self, "Delete", f"Delete host #{hid}?") != QMessageBox.Yes:
+        if QMessageBox.question(self, "Delete", f"Delete host #{host.id}?") != QMessageBox.Yes:
             return
 
         with get_session() as session:
-            host = session.get(Host, hid)
-            if host:
-                session.delete(host)
+            h2 = session.get(Host, host.id)
+            if h2:
+                session.delete(h2)
                 session.commit()
 
         self.refresh()
